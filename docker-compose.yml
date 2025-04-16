@@ -1,0 +1,26 @@
+# docker-compose.yml
+
+services:
+  rag-bot:
+    build: . # Dockerfileがあるディレクトリを指定 (カレントディレクトリ)
+    container_name: university_rag_bot # コンテナ名を指定
+    ports:
+      - "8000:8000"  # ホストの8000番ポートをコンテナの8000番ポート(FastAPI)に接続
+      - "8501:8501"  # ホストの8501番ポートをコンテナの8501番ポート(Streamlit)に接続
+    volumes:
+      # ホスト側の data/chroma をコンテナ内の /app/data/chroma にマウント (DBデータ永続化)
+      - ./data/chroma:/app/data/chroma
+      # ホスト側の src をコンテナ内の /app/src にマウント (開発中のコード変更反映用 - オプション)
+      - ./src:/app/src
+      # ホスト側のアップロードディレクトリをマウントする場合 (一時ファイル確認など)
+      # - ./static/uploads:/app/static/uploads
+    env_file:
+      - .env # .env ファイルを読み込んでコンテナ内の環境変数として設定
+    # ヘルスチェックを追加すると、コンテナの準備完了を待機できる (オプション)
+    # healthcheck:
+    #   test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+    #   interval: 30s
+    #   timeout: 10s
+    #   retries: 3
+    #   start_period: 30s # 起動直後のチェック猶予
+    
