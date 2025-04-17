@@ -1,13 +1,14 @@
-# requirements.txt (google-generativeai をバージョンアップ)
+# requirements.txt
 
 # RAG & LLM
 langchain==0.1.16
 langchain-community==0.0.34
 langchain-huggingface==0.0.3
-sentence-transformers==2.7.0
+sentence-transformers>=2.7.0  # E5モデルに対応するバージョン (最新安定版を推奨)
+transformers>=4.36.0        # sentence-transformersと互換性のあるバージョン (最新安定版を推奨)
+sentencepiece             # T5ベースモデル等で必要
 chromadb==0.4.24
-# google-generativeai==0.3.0 # 古いバージョン
-google-generativeai==0.8.4  # genai.Client が利用可能なバージョンに更新 (例)
+google-generativeai==0.8.4  # 最新版を確認しても良い
 
 # Web Frameworks & Server
 fastapi==0.109.2
@@ -16,11 +17,15 @@ streamlit==1.31.1
 
 # File Processing
 pypdf==4.0.1
-python-docx==1.1.0
+# docx2txt は python-docx よりも安定している場合がある
+docx2txt==0.8            # python-docx の代わりに docx2txt を試す
 python-multipart==0.0.7
 
 # Utilities
 requests==2.31.0
 python-dotenv==1.0.1
 werkzeug==3.0.1
-huggingface_hub[hf_xet]
+
+# その他依存関係 (通常は上記ライブラリが自動でインストール)
+# huggingface-hub
+# tokenizers

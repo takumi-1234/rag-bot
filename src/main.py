@@ -2,54 +2,73 @@
 import os
 import logging
 import shutil
-from typing import List, Dict, Optional, Tuple
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
+from typing import List, Dict, Optional, Tuple, Any # Any を追加
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-from werkzeug.utils import secure_filename # ファイル名サニタイズのために追加
+from werkzeug.utils import secure_filename
+import google.api_core.exceptions
 
 # --- 自作モジュール ---
-# (これらのファイルが src/rag ディレクトリに存在することを確認してください)
 try:
     from src.rag.chroma_manager import ChromaManager
     from src.rag.document_processor import process_documents, SUPPORTED_EXTENSIONS
     from src.rag.llm_gemini import GeminiChat
 except ImportError as e:
-    print(f"Error importing custom modules: {e}")
-    print("Please ensure 'chroma_manager.py', 'document_processor.py', and 'llm_gemini.py' exist in the 'src/rag' directory.")
+    # このエラーは Docker ビルド時またはパス設定の問題を示す
+    print(f"[FATAL] Error importing custom modules: {e}")
+    print("Ensure 'chroma_manager.py', 'document_processor.py', and 'llm_gemini.py' exist in 'src/rag' directory.")
+    print("Check PYTHONPATH if running outside Docker.")
     import sys
-    sys.exit(1)
+    sys.exit(1) # 起動不可なので終了
 
 # --- 環境変数の読み込み ---
-load_dotenv()
+# .env ファイルが存在する場合に読み込む
+dotenv_path = os.path.join(os.path.dirname(__file__), '..', '.env') # srcディレクトリの親にある .env を想定
+if os.path.exists(dotenv_path):
+    load_dotenv(dotenv_path=dotenv_path)
+    print(f"Loaded environment variables from: {dotenv_path}")
+else:
+    print(f".env file not found at {dotenv_path}, relying on system environment variables.")
+
 
 # --- ロギング設定 ---
+# コンテナログでタイムスタンプが重複しないように basicConfig を設定
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
+# Uvicorn のロガーにも設定を適用する場合（オプション）
+# logging.getLogger("uvicorn.error").propagate = False
+# logging.getLogger("uvicorn.access").propagate = False
+
 logger = logging.getLogger(__name__)
 
-# --- FastAPI アプリケーション設定 ---
-# lifespan を使うために Depends からグローバル変数へ戻すアプローチも検討
-# または、lifespan内で依存関係を解決するファクトリパターンなど
-# ここではシンプルにするため、アプリケーションスコープのシングルトンとして定義
-chroma_manager: Optional[ChromaManager] = None
-gemini_chat: Optional[GeminiChat] = None
-upload_dir: Optional[str] = None
-initialized: bool = False # 初期化成功フラグ
+# --- アプリケーションスコープのシングルトン ---
+# Optional を使うことで、初期化前は None であることを明示
+app_state: Dict[str, Any] = {
+    "chroma_manager": None,
+    "gemini_chat": None,
+    "upload_dir": None,
+    "initialized": False,
+    "initialization_error": None # 初期化失敗時のエラーメッセージ
+}
 
+# --- FastAPI アプリケーションインスタンス ---
 app = FastAPI(
     title="大学講義支援 RAG チャットボット API",
     description="講義資料のアップロードと、それに基づいた質問応答 (RAG) を行う API",
-    version="0.2.2", # バージョン更新
+    version="0.3.0", # バージョン更新
+    # lifespan=lifespan # FastAPI 0.10 lifespan context manager (推奨)
 )
 
-# --- CORS 設定 (ローカル開発用に許可) ---
+# --- CORS 設定 ---
 origins = [
     "http://localhost:8501", # Streamlit default port
     "http://127.0.0.1:8501",
+    # 必要に応じてデプロイ先のオリジンを追加
 ]
 app.add_middleware(
     CORSMiddleware,
@@ -59,71 +78,82 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- アプリケーション起動時の初期化処理 ---
-@app.on_event("startup")
-async def startup_event():
-    global chroma_manager, gemini_chat, upload_dir, initialized
-    logger.info("Starting application initialization...")
-    try:
-        # 環境変数から設定値を取得
-        chroma_db_path = os.getenv("CHROMA_DB_PATH")
-        embedding_model_name = os.getenv("EMBEDDING_MODEL_NAME", "sentence-transformers/all-mpnet-base-v2")
-        upload_dir_env = os.getenv("UPLOAD_DIR")
-        gemini_api_key = os.getenv("GEMINI_API_KEY")
-        gemini_model_name = os.getenv("GEMINI_MODEL_NAME", "gemini-pro")
+# --- アプリケーション起動/終了イベント (Lifespan) ---
+from contextlib import asynccontextmanager
 
-        # 必須の環境変数が設定されているかチェック
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("Starting application initialization...")
+    global app_state
+    try:
+        # 環境変数取得と検証
+        chroma_db_path = os.getenv("CHROMA_DB_PATH")
+        embedding_model = os.getenv("EMBEDDING_MODEL_NAME")
+        embedding_device = os.getenv("EMBEDDING_DEVICE", "cpu") # デフォルト'cpu'
+        upload_dir_env = os.getenv("UPLOAD_DIR")
+        gemini_key = os.getenv("GEMINI_API_KEY")
+        gemini_model = os.getenv("GEMINI_MODEL_NAME") # llm_geminiでデフォルト設定あり
+
         required_vars = {
             "CHROMA_DB_PATH": chroma_db_path,
-            "EMBEDDING_MODEL_NAME": embedding_model_name,
+            "EMBEDDING_MODEL_NAME": embedding_model,
             "UPLOAD_DIR": upload_dir_env,
-            "GEMINI_API_KEY": gemini_api_key
+            "GEMINI_API_KEY": gemini_key
         }
         missing_vars = [k for k, v in required_vars.items() if not v]
         if missing_vars:
-            raise ValueError(f"以下の必須環境変数が設定されていません: {', '.join(missing_vars)}。 .env ファイルを確認してください。")
+            raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}. Check .env file.")
 
-        upload_dir = upload_dir_env
-
-        # ディレクトリが存在しない場合は作成
+        # ディレクトリ作成
         os.makedirs(chroma_db_path, exist_ok=True)
-        os.makedirs(upload_dir, exist_ok=True)
-        logger.info(f"Upload directory set to: {os.path.abspath(upload_dir)}")
-        logger.info(f"ChromaDB persist directory set to: {os.path.abspath(chroma_db_path)}")
+        os.makedirs(upload_dir_env, exist_ok=True)
+        app_state["upload_dir"] = upload_dir_env
+        logger.info(f"Upload directory: {os.path.abspath(upload_dir_env)}")
+        logger.info(f"ChromaDB persist directory: {os.path.abspath(chroma_db_path)}")
 
-        # ChromaManager の初期化
-        chroma_manager = ChromaManager(
+        # ChromaManager 初期化
+        app_state["chroma_manager"] = ChromaManager(
             persist_directory=chroma_db_path,
-            embedding_model_name=embedding_model_name
+            embedding_model_name=embedding_model,
+            embedding_device=embedding_device
         )
-        logger.info(f"ChromaManager initialized successfully.")
+        logger.info(f"ChromaManager initialized.")
 
-        # GeminiChat の初期化
-        gemini_chat = GeminiChat(api_key=gemini_api_key, model_name=gemini_model_name)
-        logger.info(f"GeminiChat initialized. Model: {gemini_model_name}")
+        # GeminiChat 初期化
+        app_state["gemini_chat"] = GeminiChat(
+            api_key=gemini_key,
+            model_name=gemini_model # NoneでもOK
+        )
+        logger.info(f"GeminiChat initialized. Using model: {app_state['gemini_chat'].model_name}")
 
-        initialized = True # 全ての初期化が成功
+        app_state["initialized"] = True
         logger.info("Application initialized successfully.")
 
-    except ValueError as ve:
-        logger.error(f"Initialization error (environment variables): {ve}")
-    except ImportError as ie:
-        logger.error(f"Initialization error (module import): {ie}")
-    except RuntimeError as re:
-        logger.error(f"Initialization error (service initialization): {re}")
     except Exception as e:
-        logger.error(f"Unexpected error during application startup: {e}", exc_info=True)
-        # initialized は False のまま
+        # 初期化失敗時のエラーを記録
+        error_msg = f"Application initialization failed: {e}"
+        logger.error(error_msg, exc_info=True)
+        app_state["initialization_error"] = error_msg
+        # ここでアプリケーションを停止させるか、エラー状態で起動するか選択
+        # 例: エラー状態で起動し、ヘルスチェックでエラーを返す
+        # raise RuntimeError(error_msg) from e # => アプリケーションが起動しない
 
-@app.on_event("shutdown")
-async def shutdown_event():
+    yield # ここでアプリケーションがリクエストを受け付ける
+
+    # Shutdown
     logger.info("Application shutting down...")
-    # 必要であればリソース解放処理などをここに追加
-    # 例: chroma_manager.client.close() など (ただし ChromaDB クライアントは通常不要)
+    # 必要に応じてクリーンアップ処理をここに追加
+    # 例: chroma_manager のクリーンアップメソッド呼び出しなど (通常は不要)
+    logger.info("Shutdown complete.")
 
-# --- リクエスト/レスポンスモデル ---
+# FastAPI 0.10.x以降のlifespanを使用
+app.router.lifespan_context = lifespan
+
+
+# --- リクエスト/レスポンスモデル (変更なし) ---
 class ChatRequest(BaseModel):
-    query: str = Field(..., description="ユーザーからの質問テキスト", min_length=1) # min_length追加
+    query: str = Field(..., description="ユーザーからの質問テキスト", min_length=1)
     k: int = Field(3, description="検索する関連文書（チャンク）の数", ge=1, le=10)
 
 class ChatResponse(BaseModel):
@@ -133,7 +163,7 @@ class ChatResponse(BaseModel):
 class UploadResponse(BaseModel):
     status: str = Field(..., description="処理結果 (success または error)")
     file: Optional[str] = Field(None, description="処理されたファイル名")
-    chunks_added: Optional[int] = Field(None, description="追加/更新されたチャンク数") # add -> upsert に伴い修正
+    chunks_added: Optional[int] = Field(None, description="追加/更新されたチャンク数")
     message: Optional[str] = Field(None, description="エラーまたは成功メッセージ")
 
 class VectorStoreCountResponse(BaseModel):
@@ -143,200 +173,266 @@ class DeleteResponse(BaseModel):
     status: str = Field(..., description="処理結果 (success または error)")
     message: str = Field(..., description="処理結果メッセージ")
 
-# --- 依存性注入関数 (初期化チェック用) ---
-async def get_initialized_services() -> Dict[str, object]:
-    """
-    アプリケーションが正常に初期化されているか確認し、
-    初期化済みのサービスオブジェクトを返します。
-    初期化されていない場合は 503 Service Unavailable エラーを発生させます。
-    """
-    # グローバル変数を参照
-    if not initialized or chroma_manager is None or gemini_chat is None or upload_dir is None:
-        logger.error("Service not initialized request received.")
-        raise HTTPException(status_code=503, detail="サービスは現在利用できません (初期化失敗)。サーバー管理者にご連絡ください。")
-    return {
-        "chroma_manager": chroma_manager,
-        "gemini_chat": gemini_chat,
-        "upload_dir": upload_dir
-    }
+# --- 依存性注入関数 (初期化チェックとサービス取得) ---
+# 型ヒントをより具体的に
+def get_chroma_manager() -> ChromaManager:
+    if not app_state["initialized"] or app_state["chroma_manager"] is None:
+        logger.error("ChromaManager requested but not initialized.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Service not available (Initialization Error: {app_state.get('initialization_error', 'Unknown error')})"
+        )
+    return app_state["chroma_manager"]
+
+def get_gemini_chat() -> GeminiChat:
+    if not app_state["initialized"] or app_state["gemini_chat"] is None:
+        logger.error("GeminiChat requested but not initialized.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Service not available (Initialization Error: {app_state.get('initialization_error', 'Unknown error')})"
+        )
+    return app_state["gemini_chat"]
+
+def get_upload_dir() -> str:
+    if not app_state["initialized"] or app_state["upload_dir"] is None:
+        logger.error("Upload directory requested but not initialized.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Service not available (Initialization Error: {app_state.get('initialization_error', 'Unknown error')})"
+        )
+    return app_state["upload_dir"]
+
 
 # --- API エンドポイント ---
 
 @app.get("/health", summary="ヘルスチェック", tags=["システム"])
 async def health_check():
-    """アプリケーションが正常に起動し、初期化されているか確認します。"""
-    # グローバル変数を参照
-    if not initialized:
-         raise HTTPException(status_code=503, detail="サービス初期化失敗")
-    logger.info("Health check requested: Service is healthy.")
-    return {"status": "ok", "initialized": initialized}
-
-@app.post("/api/upload", response_model=UploadResponse, summary="講義資料のアップロード", tags=["資料管理"])
-async def upload_lecture_document(
-    file: UploadFile = File(..., description=f"アップロードするファイル。対応形式: {', '.join(SUPPORTED_EXTENSIONS)}"),
-    services: dict = Depends(get_initialized_services)
-    ) -> UploadResponse:
-    """
-    講義資料ファイル (PDF, DOCX, TXT) をアップロードし、テキストを抽出してベクトル化し、
-    ベクトルデータベースに保存（または更新）します。
-    """
-    chroma: ChromaManager = services["chroma_manager"]
-    upload_path: str = services["upload_dir"]
-
-    # ファイル名をサニタイズ
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="ファイル名がありません。")
-    # secure_filename を使用して安全なファイル名を取得
-    safe_filename = secure_filename(file.filename)
-    if not safe_filename: # サニタイズの結果、空になった場合など
-        safe_filename = "uploaded_file" # デフォルト名
-    file_path = os.path.join(upload_path, safe_filename)
-
-    # ファイル拡張子の検証
-    file_ext = os.path.splitext(safe_filename)[1].lower()
-    if file_ext not in SUPPORTED_EXTENSIONS:
-        logger.warning(f"Unsupported file type uploaded: {safe_filename}")
+    """アプリケーションの初期化状態と基本的な動作を確認します。"""
+    if not app_state["initialized"]:
+         raise HTTPException(
+             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+             detail=f"Service initialization failed: {app_state.get('initialization_error', 'Unknown error')}"
+         )
+    # オプション: ChromaDBへの接続確認など、より詳細なチェックを追加
+    try:
+        count = app_state["chroma_manager"].count_documents() # 簡単なDB操作を試す
+        return {"status": "ok", "initialized": True, "vector_store_count": count}
+    except Exception as e:
+        logger.error(f"Health check dependency error (ChromaDB?): {e}", exc_info=True)
         raise HTTPException(
-            status_code=400,
-            detail=f"サポートされていないファイル形式です: '{file_ext}'。サポート形式: {', '.join(SUPPORTED_EXTENSIONS)}"
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Service dependency check failed: {e}"
         )
 
-    logger.info(f"ファイル受信開始: {safe_filename}")
 
+@app.post(
+    "/api/upload",
+    response_model=UploadResponse,
+    summary="講義資料のアップロード",
+    status_code=status.HTTP_201_CREATED, # 成功時のステータスコード
+    tags=["資料管理"]
+)
+async def upload_lecture_document(
+    file: UploadFile = File(..., description=f"アップロードするファイル。対応形式: {', '.join(SUPPORTED_EXTENSIONS.keys())}"),
+    chroma: ChromaManager = Depends(get_chroma_manager),
+    upload_path: str = Depends(get_upload_dir)
+    ) -> UploadResponse:
+    """アップロードされたファイルを処理し、ベクトルDBに追加します。"""
+    if not file.filename:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Filename cannot be empty.")
+
+    # 安全なファイル名を取得し、空の場合はデフォルト名を生成
+    safe_filename = secure_filename(file.filename)
+    if not safe_filename:
+        base, ext = os.path.splitext(file.filename) # 元の拡張子を保持しようと試みる
+        safe_filename = "uploaded_file_" + os.urandom(4).hex() + (ext if ext else "")
+        logger.warning(f"Original filename '{file.filename}' sanitized, using default: {safe_filename}")
+
+    file_path = os.path.join(upload_path, safe_filename)
+    file_ext = os.path.splitext(safe_filename)[1].lower()
+
+    logger.info(f"Received file upload request: {safe_filename} (Type: {file.content_type}, Extension: '{file_ext}')")
+
+    # サポートされている拡張子かチェック
+    if file_ext not in SUPPORTED_EXTENSIONS:
+        logger.warning(f"Unsupported file type attempt: {safe_filename} (Extension: '{file_ext}')")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported file type: '{file_ext}'. Supported types: {', '.join(SUPPORTED_EXTENSIONS.keys())}"
+        )
+
+    # 一時ファイルに保存
     try:
-        # ファイルを一時保存
         with open(file_path, "wb") as buffer:
              shutil.copyfileobj(file.file, buffer)
-        logger.info(f"ファイル保存完了: {file_path}")
+        logger.info(f"File saved temporarily to: {file_path}")
 
-        # ドキュメント処理とベクトルDBへの追加/更新
+        # ドキュメント処理 (ロード、分割)
         documents = process_documents(file_path)
+
         if documents:
             chunks_count = len(documents)
-            # add_documents は upsert 動作 (chroma_manager.py で修正済みと仮定)
+            # ベクトルDBに追加
             chroma.add_documents(documents)
-            logger.info(f"{safe_filename} から {chunks_count} 個のチャンクを処理し、ベクトルDBに追加/更新しました。")
-            return UploadResponse(status="success", file=safe_filename, chunks_added=chunks_count, message="ファイルの処理とベクトルDBへの追加/更新が完了しました。")
+            logger.info(f"Successfully processed and added {chunks_count} chunks from '{safe_filename}' to vector store.")
+            return UploadResponse(
+                status="success",
+                file=safe_filename,
+                chunks_added=chunks_count,
+                message="File processed and added to vector store successfully."
+            )
         else:
-            logger.warning(f"ファイルからテキストを抽出または分割できませんでした: {safe_filename}")
-            # 一時ファイルが存在すれば削除
-            if os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                    logger.info(f"テキスト抽出失敗のため一時ファイルを削除しました: {file_path}")
-                except OSError as e:
-                    logger.error(f"一時ファイルの削除に失敗しました {file_path}: {e}")
-            raise HTTPException(status_code=400, detail="ファイルからテキストを抽出または分割できませんでした。空のファイルか、非対応のフォーマット、または処理中にエラーが発生した可能性があります。")
+            # process_documents が空リストを返した場合 (サポート対象だが内容がない、または処理失敗)
+            logger.warning(f"No processable content found or processing failed for file: {safe_filename}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Could not extract or process text from the file '{safe_filename}'. It might be empty, corrupted, password-protected, or an internal error occurred during processing."
+            )
 
     except HTTPException as http_exc:
-         # 既に HTTPException が発生している場合はそのまま再送出
+         # 既に HTTP 例外の場合はそのまま送出
          raise http_exc
     except Exception as e:
-        logger.error(f"ファイル処理中に予期せぬエラーが発生しました ({safe_filename}): {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"サーバー内部エラーが発生しました。ファイル処理に失敗しました: {e}")
+        # その他の予期せぬエラー
+        logger.error(f"Unexpected error during file upload processing ({safe_filename}): {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An internal server error occurred while processing the file: {e}"
+        )
     finally:
-        # 正常終了・異常終了問わず、一時ファイルを削除 (ただし抽出失敗時は上記で削除済みの場合あり)
+        # 一時ファイルを削除
         if os.path.exists(file_path):
             try:
                 os.remove(file_path)
-                logger.info(f"処理完了のため一時ファイルを削除しました: {file_path}")
-            except OSError as e:
-                logger.error(f"一時ファイルの削除に失敗しました {file_path}: {e}")
-        # アップロードされたファイルのストリームを閉じる
+                logger.info(f"Temporary file deleted: {file_path}")
+            except OSError as e_remove:
+                logger.error(f"Failed to delete temporary file {file_path}: {e_remove}")
+        # ファイルストリームを閉じる (FastAPIが通常管理するが念のため)
         await file.close()
-        logger.info(f"ファイルストリームを閉じました: {safe_filename}")
+        logger.info(f"File stream closed for: {safe_filename}")
 
 
 @app.post("/api/chat", response_model=ChatResponse, summary="RAG チャットボットとの対話", tags=["チャット"])
 async def chat_with_rag_bot(
     request: ChatRequest,
-    services: dict = Depends(get_initialized_services)
+    chroma: ChromaManager = Depends(get_chroma_manager),
+    llm: GeminiChat = Depends(get_gemini_chat)
     ) -> ChatResponse:
-    """
-    ユーザーからの質問を受け取り、ベクトルストアから関連文書を検索し、
-    その情報をコンテキストとして大規模言語モデル (LLM) に渡し、回答を生成させます。
-    """
-    chroma: ChromaManager = services["chroma_manager"]
-    llm: GeminiChat = services["gemini_chat"]
+    """ユーザーの質問に基づき、関連文書を検索し、LLMで回答を生成します。"""
     query = request.query
     k = request.k
-
-    logger.info(f"チャットリクエスト受信: query='{query[:100]}...', k={k}") # クエリが長い場合を考慮してログを抑制
+    logger.info(f"Chat request received: query='{query[:100]}...', k={k}")
 
     try:
-        # 1. ベクトルストアで関連文書を検索
-        logger.info(f"ベクトルストアで類似文書を検索中 (k={k})...")
+        # 1. ベクトルストアで類似文書を検索
+        logger.info(f"Searching vector store for relevant documents (k={k})...")
         search_results: List[Document] = chroma.search(query, k=k)
 
+        # 検索結果からソース情報を抽出
         sources: List[str] = []
         if not search_results:
-            logger.info("関連文書が見つかりませんでした。")
+            logger.info("No relevant documents found in vector store.")
         else:
-            # 取得したDocumentオブジェクトからソースファイル名を取得 (重複除去)
-            sources = sorted(list(set([
-                doc.metadata.get('source', '不明なソース')
+            sources = sorted(list(set(
+                doc.metadata.get('source')
                 for doc in search_results if doc.metadata and doc.metadata.get('source')
-            ])))
-            logger.info(f"{len(search_results)} 件の関連コンテキストを取得しました。ソース: {sources}")
+            )))
+            logger.info(f"Retrieved {len(search_results)} context documents. Sources: {sources}")
 
-        # 2. LLM に回答生成をリクエスト (引数名を context_docs に修正)
-        logger.info("LLM に回答生成をリクエストします...")
-        response_text = llm.generate_response(query=query, context_docs=search_results) # ここを修正！
-        logger.info("LLM から回答を受信しました。")
+        # 2. LLM に回答生成をリクエスト
+        logger.info("Generating response using LLM...")
+        response_text = llm.generate_response(query=query, context_docs=search_results)
+        logger.info("LLM generated response successfully.")
 
-        # 3. レスポンスを返す
         return ChatResponse(response=response_text, sources=sources)
 
-    except HTTPException as http_exc:
-        # search や generate_response 内で HTTPException が発生した場合
-        raise http_exc
+    # --- エラーハンドリング ---
+    except ValueError as ve:
+        # GeminiChatでの入力バリデーションエラーなど
+        logger.warning(f"Chat request validation error: {ve}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
+    except google.api_core.exceptions.PermissionDenied as e_perm:
+        logger.error(f"Gemini API Permission Denied: {e_perm}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied for Gemini API. Check API key or project settings.")
+    except google.api_core.exceptions.ResourceExhausted as e_res:
+        logger.error(f"Gemini API Resource Exhausted: {e_res}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Gemini API quota exceeded. Please try again later.")
+    except google.api_core.exceptions.DeadlineExceeded as e_timeout:
+        logger.error(f"Gemini API Deadline Exceeded: {e_timeout}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="Gemini API request timed out.")
+    except google.api_core.exceptions.InternalServerError as e_internal:
+         logger.error(f"Gemini API Internal Server Error: {e_internal}", exc_info=True)
+         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Gemini API encountered an internal server error.")
+    except google.api_core.exceptions.InvalidArgument as e_invalid:
+         logger.error(f"Gemini API Invalid Argument: {e_invalid}", exc_info=True)
+         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid argument sent to Gemini API: {e_invalid}")
+    except RuntimeError as re:
+        # llm_gemini.py 内でのブロックや ChromaManager のエラーなど
+        logger.error(f"Runtime error during chat processing: {re}", exc_info=True)
+        # エラーメッセージをそのままクライアントに返すのはセキュリティリスクの可能性あり
+        # 詳細なエラーはログに記録し、クライアントには一般的なエラーメッセージを返すのが良い場合も
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(re))
     except Exception as e:
-        logger.error(f"チャット処理中に予期せぬエラーが発生しました (Query: '{query[:100]}...'): {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"チャット処理中に予期せぬサーバーエラーが発生しました。")
+        # その他の予期せぬエラー
+        logger.error(f"Unexpected error during chat processing (Query: '{query[:100]}...'): {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected internal server error occurred during chat processing."
+        )
 
-@app.get("/api/vectorstore/count", response_model=VectorStoreCountResponse, summary="ベクトルストアのドキュメント数取得", tags=["ベクトルストア管理"])
-async def get_vector_store_document_count(services: dict = Depends(get_initialized_services)) -> VectorStoreCountResponse:
-    """ベクトルストアに格納されているドキュメント（チャンク）の総数を取得します。"""
-    chroma: ChromaManager = services["chroma_manager"]
+
+@app.get(
+    "/api/vectorstore/count",
+    response_model=VectorStoreCountResponse,
+    summary="ベクトルストアのドキュメント数取得",
+    tags=["ベクトルストア管理"]
+)
+async def get_vector_store_document_count(chroma: ChromaManager = Depends(get_chroma_manager)) -> VectorStoreCountResponse:
+    """ベクトルストア内のドキュメント（チャンク）総数を取得します。"""
     try:
         count = chroma.count_documents()
-        logger.info(f"ベクトルストアのドキュメント数を取得しました: {count}")
+        logger.info(f"Retrieved vector store document count: {count}")
         return VectorStoreCountResponse(count=count)
     except Exception as e:
-        logger.error(f"ベクトルストアのカウント取得中にエラーが発生しました: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"カウント取得中にサーバーエラーが発生しました。")
+        logger.error(f"Error retrieving vector store count: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve vector store count: {e}"
+        )
 
-@app.delete("/api/vectorstore/delete_all", response_model=DeleteResponse, summary="ベクトルストアのコレクション削除", tags=["ベクトルストア管理"])
-async def delete_all_documents_from_vector_store(services: dict = Depends(get_initialized_services)) -> DeleteResponse:
-    """
-    ベクトルストアのコレクション全体を削除します。
-    **注意:** この操作は元に戻せません。本番環境での使用は特に注意してください。
-    """
-    chroma: ChromaManager = services["chroma_manager"]
-    collection_name_to_delete = chroma.collection_name # 削除するコレクション名を取得
+@app.delete(
+    "/api/vectorstore/delete_all",
+    response_model=DeleteResponse,
+    summary="ベクトルストアのコレクション削除",
+    tags=["ベクトルストア管理"]
+)
+async def delete_all_documents_from_vector_store(chroma: ChromaManager = Depends(get_chroma_manager)) -> DeleteResponse:
+    """ベクトルストア内の全ドキュメント（コレクション自体）を削除します。"""
+    collection_name_to_delete = chroma.collection_name
     try:
-        logger.warning(f"ベクトルストアのコレクション '{collection_name_to_delete}' の削除リクエストを受け付けました。")
-        count_before = chroma.count_documents() # 削除前の件数をログに残す
+        logger.warning(f"Request received to delete vector store collection: '{collection_name_to_delete}'")
+        count_before = chroma.count_documents() # 削除前の件数を記録
 
-        chroma.delete_collection() # ChromaManagerのメソッドを使用
+        chroma.delete_collection() # 削除実行
 
-        message = f"ベクトルストアのコレクション '{collection_name_to_delete}' を削除しました (以前の件数: {count_before})。次回起動時に空のコレクションが再作成されます。"
+        message = f"Vector store collection '{collection_name_to_delete}' deleted successfully (contained {count_before} documents). A new empty collection will be created on the next operation or restart."
         logger.info(message)
         return DeleteResponse(status="success", message=message)
     except RuntimeError as re:
-         logger.error(f"コレクション '{collection_name_to_delete}' の削除中にエラーが発生しました: {re}", exc_info=True)
-         raise HTTPException(status_code=500, detail=f"コレクション削除中にエラーが発生しました: {re}")
+         logger.error(f"Error deleting collection '{collection_name_to_delete}': {re}", exc_info=True)
+         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to delete collection: {re}")
     except Exception as e:
-        logger.error(f"コレクション '{collection_name_to_delete}' の削除中に予期せぬエラーが発生しました: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"コレクション削除中に予期せぬサーバーエラーが発生しました。")
+        logger.error(f"Unexpected error deleting collection '{collection_name_to_delete}': {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred during collection deletion.")
 
-# --- Uvicornでの直接実行用 (主にデバッグ目的) ---
+# --- Uvicornでの直接実行用 ---
 if __name__ == "__main__":
     import uvicorn
+    # 環境変数からポート、ホスト、リロード設定を取得
     port = int(os.getenv("PORT", 8000))
-    host = os.getenv("HOST", "127.0.0.1")
-    reload = os.getenv("UVICORN_RELOAD", "false").lower() == "true"
+    # デフォルトのホストを 0.0.0.0 に変更し、コンテナ外部からのアクセスを許可
+    host = os.getenv("HOST", "0.0.0.0")
+    reload = os.getenv("UVICORN_RELOAD", "false").lower() in ["true", "1", "t"]
 
-    logger.info(f"Starting Uvicorn server directly on {host}:{port} with reload={reload}")
-    # 初期化が失敗していても Uvicorn は起動するが、API は 503 を返す
+    print(f"Starting Uvicorn server directly on {host}:{port} with reload={reload}")
     uvicorn.run("main:app", host=host, port=port, reload=reload)
